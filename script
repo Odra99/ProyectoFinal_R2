@@ -1,0 +1,112 @@
+Ith0
+IF2=eth1
+IF3=eth2
+IP1=192.168.22.99
+IP2=192.168.99.99
+GW1=192.168.22.2
+GW2=192.168.99.1
+NET1=192.168.22.0/24
+NET2=192.168.99.0/24
+DNS1=193.92.150.3
+DNS2=195.170.0.1
+
+# Create 2 new routing tables
+if ! cat /etc/iproute2/rt_tables | grep -q '^251'
+then
+    echo '251   T1' >> /etc/iproute2/rt_tables
+fi
+if ! cat /etc/iproute2/rt_tables | grep -q '^252'
+then
+    echo '252   T2' >> /etc/iproute2/rt_tables
+fi
+ip route flush table T1
+ip route flush table T2
+
+# Associate routing tables with the different ISPs.
+ip route add $NET1 dev $IF1 src $IP1 table T1
+ip route add default via $GW1 table T1
+ip route add $NET2 dev $IF2 src $IP2 table T2
+ip route add default via $GW2 table T2
+ip route add $NET1 dev $IF1 src $IP1
+ip route add $NET2 dev $IF2 src $IP2
+
+# Add your other networks to both tables.
+ip route add 10.0.0.0/8 via 192.168.22.4 table T1
+ip route add 10.0.0.0/8 via 192.168.22.4 table T2
+
+# Delete old rules.
+ip rule del from all fwmark 0x1 lookup T1 2>/dev/null
+ip rule del from all fwmark 0x2 lookup T2 2>/dev/null
+ip rule del from all fwmark 0x2 2>/dev/null
+ip rule del from all fwmark 0x1 2>/dev/null
+ip rule del from $IP1
+ip rule del from $IP2
+
+# Add new rules for connection tracking to our routing tables.
+ip rule add from $IP1 table T1
+ip rule add from $IP2 table T2
+ip rule add fwmark 1 table T1
+ip rule add fwmark 2 table T2 
+
+# You need these system settings.
+echo 1 > /proc/sys/net/ipv4/ip_forward
+for f in /proc/sys/net/ipv4/conf/*/rp_filter ; do echo 1 > $f ; done
+
+# Clear iptables/netfilter settings.
+iptables -F
+iptables -X
+iptables -t nat -F
+iptables -t nat -X
+iptables -t filter -F
+iptables -t filter -X
+iptables -t mangle -F
+iptables -t mangle -X
+ 
+# Set up connection tracking and Source NAT.
+
+# Create two chains that will mark the packet. 
+iptables -t mangle -N MARK1
+iptables -t mangle -A MARK1 -j MARK --set-mark 1
+iptables -t mangle -A MARK1 -j CONNMARK --save-mark
+iptables -t mangle -N MARK2
+iptables -t mangle -A MARK2 -j MARK --set-mark 2
+iptables -t mangle -A MARK2 -j CONNMARK --save-mark
+ 
+iptables -t nat -N OUT_IF1
+iptables -t nat -A OUT_IF1 -j SNAT --to-source $IP1
+iptables -t nat -N OUT_IF2
+iptables -t nat -A OUT_IF2 -j SNAT --to-source $IP2
+
+iptables -t nat -A POSTROUTING -o $IF1 -j OUT_IF1
+iptables -t nat -A POSTROUTING -o $IF2 -j OUT_IF2
+ 
+iptables -t nat -N IN_IF1
+iptables -t nat -A IN_IF1 -j MARK --set-mark 1
+iptables -t nat -A IN_IF1 -j CONNMARK --save-mark
+ iptables -t nat -N IN_IF2
+ iptables -t nat -A IN_IF2 -j MARK --set-mark 2
+ iptables -t nat -A IN_IF2 -j CONNMARK --save-mark
+  
+ iptables -t nat -A PREROUTING -i $IF1 -j IN_IF1
+ iptables -t nat -A PREROUTING -i $IF2 -j IN_IF2
+ 
+ # TCP balancing. ISP#1 has twice the connection speed of ISP#2, so in every 3 packets two should go to ISP#1 and one to ISP#2.
+ iptables -t mangle -A PREROUTING -i $IF3 -p tcp -m tcp -m state --state NEW -m statistic --mode nth --every 3 --packet 0 -j MARK1
+ iptables -t mangle -A PREROUTING -i $IF3 -p tcp -m tcp -m state --state NEW -m statistic --mode nth --every 3 --packet 1 -j MARK2
+ iptables -t mangle -A PREROUTING -i $IF3 -p tcp -m tcp -m state --state NEW -m statistic --mode nth --every 3 --packet 2 -j MARK1
+ 
+ # Restore mark on packets belonging to existing connections.
+ iptables -t mangle -A PREROUTING -i $IF3 -p tcp -m tcp -m state --state ESTABLISHED,RELATED -j CONNMARK --restore-mark
+  
+ # UDP balancing. Same story as above.
+ iptables -t mangle -A PREROUTING -i $IF3 -p udp -m udp -m statistic --mode nth --every 3 --packet 0 -j MARK1
+ iptables -t mangle -A PREROUTING -i $IF3 -p udp -m udp -m statistic --mode nth --every 3 --packet 1 -j MARK2
+ iptables -t mangle -A PREROUTING -i $IF3 -p udp -m udp -m statistic --mode nth --every 3 --packet 2 -j MARK1
+  
+ # Send DNS requests through the correct ISP or they will fail.
+ iptables -t mangle -A PREROUTING -p tcp --dport 53 -d $DNS1 -j MARK1
+ iptables -t mangle -A PREROUTING -p udp --dport 53 -d $DNS1 -j MARK1
+ iptables -t mangle -A PREROUTING -p tcp --dport 53 -d $DNS2 -j MARK2
+ iptables -t mangle -A PREROUTING -p udp --dport 53 -d $DNS2 -j MARK2
+ 
+ ip route flush cache
